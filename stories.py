@@ -10,6 +10,7 @@ class UserSession:
 
 @dataclass
 class Event:
+    message_id: Optional[int]
     user_id: int
 
 
@@ -50,9 +51,7 @@ class OutMessage:
     next: Optional["OutMessage"] = None
     parse_mode: Optional[str] = None
     buttons_below: Optional[list[list[Button]]] = None
-    edit_the_last: bool = (
-        False  # Indicates that the message should be sent as an edit to the last one
-    )
+    edit_message_with_id: Optional[int] = None
 
     def __add__(self, other: "OutMessage") -> "OutMessage":
         insert_after = self
@@ -63,7 +62,9 @@ class OutMessage:
 
     def __repr__(self) -> str:
         next = "..." if self.next else None
-        s_edit = " EDIT" if self.edit_the_last else ""
+        s_edit = (
+            f" EDIT #{self.edit_message_with_id}" if self.edit_message_with_id else ""
+        )
         return f"OutMessage(text={repr(self.text[:30])}, next={next}, parse_mode={self.parse_mode}, buttons={repr(self.buttons)}, buttons_below={repr(self.buttons_below)}{s_edit})"
 
 

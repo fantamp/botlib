@@ -13,8 +13,12 @@ from telegram.ext import (
 import telegram
 
 
+MessageId = int
+
+
 @dataclasses.dataclass
 class TgIncomingMsg:
+    message_id: Optional[MessageId]
     user_id: int
     user_name: str
     text: str
@@ -30,14 +34,15 @@ class InlineKeyboardButton:
 @dataclasses.dataclass
 class TgOutgoingMsg:
     user_id: int
-    user_name: str | None
+    user_name: Optional[str]
     text: str
-    inline_keyboard: list[list[InlineKeyboardButton]] | None = None
-    keyboard_below: Optional[str] = None
+    inline_keyboard: Optional[list[list[InlineKeyboardButton]]] = None
+    keyboard_below: Optional[list[list[str]]] = None
     parse_mode: Optional[str] = None
+    edit_message_with_id: Optional[MessageId] = None
 
 
-OnMessageType = Callable[[TgIncomingMsg], Optional[str]]
+OnMessageType = Callable[[TgIncomingMsg], list[TgOutgoingMsg]]
 
 
 class Tg:
@@ -59,6 +64,7 @@ class TelegramMock(Tg):
         self.outgoing: list[TgOutgoingMsg] = []  # type: ignore
         self.incoming: list[TgIncomingMsg] = []  # type: ignore
         self.admin_contacts: Optional[list[str]] = None  # type: ignore
+        self._message_id_counter = 0
 
     def send_message(self, m: TgOutgoingMsg):
         if not isinstance(m, TgOutgoingMsg):
@@ -72,10 +78,18 @@ class TelegramMock(Tg):
         text: str,
         keyboard_callback: str | None = None,
     ):
-        m = TgIncomingMsg(from_user_id, from_user_name, text, keyboard_callback)
+        self._message_id_counter += 1
+        m = TgIncomingMsg(
+            self._message_id_counter,
+            from_user_id,
+            from_user_name,
+            text,
+            keyboard_callback,
+        )
         self.incoming.append(m)
         if self.on_message is not None:
-            self.on_message(m)
+            replies = self.on_message(m)
+            self.outgoing.extend(replies)
 
 
 class TelegramReal(Tg):
@@ -90,6 +104,9 @@ class TelegramReal(Tg):
     def run_forever(self):
         self.application.run_polling(allowed_updates=Update.ALL_TYPES)
 
+    def send_message(self, m: TgOutgoingMsg):
+        asyncio.create_task(self._send_message(m))
+
     async def _default_handler(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ):
@@ -102,14 +119,16 @@ class TelegramReal(Tg):
             logging.warning(f"got invalid message. Update: {update}")
             return
         message = TgIncomingMsg(
+            update.message.message_id,
             update.effective_chat.id,
             update.effective_chat.username,
             update.message.text,
         )
         try:
-            self.on_message(message)
+            replies = self.on_message(message)
         except ValueError as e:
             await update.message.reply_text(f"Error: {str(e)}")
+        await self._send_messages(replies)
 
     async def _callback_query_handler(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -120,40 +139,47 @@ class TelegramReal(Tg):
             logging.warning(f"got invalid callback query. Update: {update}")
             return
 
+        # CallbackQueries need to be answered, even if no notification to the user is needed
+        # Some clients may have trouble otherwise. See https://core.telegram.org/bots/api#callbackquery
+        await query.answer()
+
         if update.effective_chat is None or update.effective_chat.username is None:
             logging.warning(f"got invalid query callback update. Update: {update}")
             return
         message = TgIncomingMsg(
+            (query.message.message_id if (query.message is not None) else None),
             update.effective_chat.id,
             update.effective_chat.username,
             "",
             keyboard_callback=query.data,
         )
 
-        replace_text: Optional[str] = None
+        replies: list[TgOutgoingMsg]
         try:
-            replace_text = self.on_message(message)
+            replies = self.on_message(message)
         except ValueError as e:
-            logging.error(f"Error: {str(e)}")
+            logging.exception(f"_callback_query_handler: exception: {e}")
+        else:
+            # FIXME: the text building should eventually go away and the responsibility should be moved to the controller which should take text from LRU messages cache
+            edits = [m for m in replies if m.edit_message_with_id is not None]
+            edit = edits[0] if edits else None
+            if edit:
+                replace_text = edit.text
+                lines = []
+                if (
+                    update.callback_query is not None
+                    and update.callback_query.message is not None
+                    and update.callback_query.message.text is not None
+                ):
+                    lines += [update.callback_query.message.text, ""]
+                s = "PREV + " if lines else ""
+                logging.info(f"replacing text: {s}{replace_text}")
+                lines.append(replace_text)
+                edit.text = "\n".join(lines)
+                edit.parse_mode = "Markdown"
+            await self._send_messages(replies)
 
-        # CallbackQueries need to be answered, even if no notification to the user is needed
-        # Some clients may have trouble otherwise. See https://core.telegram.org/bots/api#callbackquery
-        await query.answer()
-        if replace_text is not None:
-            lines = []
-            if (
-                update.callback_query is not None
-                and update.callback_query.message is not None
-                and update.callback_query.message.text is not None
-            ):
-                lines += [update.callback_query.message.text, ""]
-            s = "PREV + " if lines else ""
-            logging.info(f"replacing text: {s}{replace_text}")
-            lines.append(replace_text)
-            text = "\n".join(lines)
-            await query.edit_message_text(text=text, parse_mode="Markdown")
-
-    def send_message(self, m: TgOutgoingMsg):
+    async def _send_message(self, m: TgOutgoingMsg):
         reply_markup: Any = None
         if m.keyboard_below is not None:
             assert isinstance(m.keyboard_below, list)
@@ -176,8 +202,19 @@ class TelegramReal(Tg):
             ]
             reply_markup = telegram.InlineKeyboardMarkup(keyboard)
 
-        asyncio.create_task(
-            self.application.bot.send_message(
+        if m.edit_message_with_id is not None:
+            res = self.application.bot.edit_message_text(
+                text=m.text,
+                chat_id=m.user_id,
+                message_id=m.edit_message_with_id,
+                parse_mode=m.parse_mode,
+            )
+        else:
+            res = self.application.bot.send_message(
                 m.user_id, m.text, parse_mode=m.parse_mode, reply_markup=reply_markup
             )
-        )
+        await res
+
+    async def _send_messages(self, messages: list[TgOutgoingMsg]):
+        for m in messages:
+            await self._send_message(m)
