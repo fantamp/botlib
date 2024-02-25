@@ -2,7 +2,7 @@ from typing import Callable, Optional, Any
 import asyncio
 import dataclasses
 import logging
-from telegram import Update, ReplyKeyboardRemove
+from telegram import Message, Update, ReplyKeyboardRemove
 from telegram.ext import (
     Application,
     ContextTypes,
@@ -46,8 +46,14 @@ OnMessageType = Callable[[TgIncomingMsg], list[TgOutgoingMsg]]
 
 
 class Tg:
+    _on_message: Optional[OnMessageType]
+
+    def __init__(self):
+        self._on_message = None
+
     @property
     def on_message(self) -> OnMessageType:
+        assert self._on_message is not None
         return self._on_message
 
     @on_message.setter
@@ -59,10 +65,13 @@ class Tg:
 
 
 class TelegramMock(Tg):
+    outgoing: list[TgOutgoingMsg]
+    incoming: list[TgIncomingMsg]
+
     def __init__(self):
         super().__init__()
-        self.outgoing: list[TgOutgoingMsg] = []  # type: ignore
-        self.incoming: list[TgIncomingMsg] = []  # type: ignore
+        self.outgoing = []
+        self.incoming = []
         self._message_id_counter = 0
 
     def send_message(self, m: TgOutgoingMsg):
@@ -166,7 +175,7 @@ class TelegramReal(Tg):
                 lines = []
                 if (
                     update.callback_query is not None
-                    and update.callback_query.message is not None
+                    and isinstance(update.callback_query.message, Message)
                     and update.callback_query.message.text is not None
                 ):
                     lines += [update.callback_query.message.text, ""]
