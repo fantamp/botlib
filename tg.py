@@ -99,6 +99,10 @@ class TelegramMock(Tg):
             replies = self.on_message(m)
             self.outgoing.extend(replies)
 
+    @property
+    def last_out_message(self) -> Optional[TgOutgoingMsg]:
+        return self.outgoing[-1] if self.outgoing else None
+
 
 class TelegramReal(Tg):
     def __init__(self, token: str):
